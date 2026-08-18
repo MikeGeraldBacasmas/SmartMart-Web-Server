@@ -4,8 +4,8 @@ const { authenticate, requireRole } = require("../middleware/auth");
 
 // GET /api/transactions?from=YYYY-MM-DD&to=YYYY-MM-DD
 router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) => {
-  const from = req.query.from || new Date().toISOString().slice(0, 10);
-  const to   = req.query.to   || new Date().toISOString().slice(0, 10);
+  const from = req.query.from || "2000-01-01";
+  const to   = req.query.to   || "2099-12-31";
   try {
     res.json(await call("sp_get_transactions", [from, to]));
   } catch (err) {
@@ -13,8 +13,35 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
   }
 });
 
+// GET /api/transactions/my-history  — customer purchase history
+router.get("/my-history", authenticate, async (req, res) => {
+  try {
+    const conn = await pool.getConnection();
+    try {
+      const [rows] = await conn.query(
+        `SELECT t.id, t.receipt_no,
+                IFNULL(CONCAT(c.last_name, ', ', c.first_name), 'Customer') AS customer,
+                s.full_name AS cashier,
+                t.total_amount, t.cash_tendered, t.change_amount,
+                DATE_FORMAT(t.created_at, '%b %d, %Y %h:%i %p') AS date
+         FROM transactions t
+         JOIN customers c ON c.id = t.customer_id
+         JOIN staff s ON s.id = t.cashier_id
+         WHERE c.user_id = ?
+         ORDER BY t.created_at DESC`,
+        [req.user.id]
+      );
+      res.json(rows);
+    } finally {
+      conn.release();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/transactions/:id/items
-router.get("/:id/items", authenticate, requireRole("admin", "staff"), async (req, res) => {
+router.get("/:id/items", authenticate, requireRole("admin", "staff", "customer"), async (req, res) => {
   try {
     res.json(await call("sp_get_transaction_items", [req.params.id]));
   } catch (err) {
@@ -65,3 +92,4 @@ router.post("/", authenticate, requireRole("admin", "staff"), async (req, res) =
 });
 
 module.exports = router;
+
