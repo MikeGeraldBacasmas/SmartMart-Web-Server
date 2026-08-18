@@ -48,6 +48,41 @@ router.post("/register", async (req, res) => {
   }
 });
 
+// GET /api/customers/my-profile — customer fetches own profile
+router.get("/my-profile", authenticate, requireRole("customer"), async (req, res) => {
+  try {
+    const rows = await call("sp_get_customer_profile", [req.user.id]);
+    if (!rows || rows.length === 0)
+      return res.status(404).json({ error: "Customer profile not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/customers/my-profile — customer updates own profile
+router.put("/my-profile", authenticate, requireRole("customer"), async (req, res) => {
+  const { first_name, last_name, middle_name, address,
+          phone, gender, civil_status, date_of_birth } = req.body;
+
+  if (!first_name || !last_name || !address || !phone
+      || !gender || !civil_status || !date_of_birth)
+    return res.status(400).json({ error: "All required fields must be provided" });
+
+  try {
+    const rows = await call("sp_update_customer_profile", [
+      req.user.id, first_name, last_name, middle_name || null,
+      address, phone, gender, civil_status, date_of_birth,
+    ]);
+    const updated = rows?.[0];
+    if (!updated)
+      return res.status(404).json({ error: "Customer profile not found" });
+    res.json({ message: "Profile updated successfully", profile: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/customers/:id/approve
 router.post("/:id/approve", authenticate, requireRole("admin"), async (req, res) => {
   const { username, password } = req.body;
