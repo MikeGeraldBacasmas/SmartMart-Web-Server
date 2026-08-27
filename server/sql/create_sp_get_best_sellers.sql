@@ -13,7 +13,7 @@ BEGIN
   WHERE p.is_active = 1
   GROUP BY p.id, p.name, p.price
   HAVING total_sold > 0
-  ORDER BY total_sold DESC, total_revenue DESC
+  ORDER BY total_revenue DESC, total_sold DESC
   LIMIT 5;
 END //
 DELIMITER ;
