@@ -94,13 +94,20 @@ router.post("/:id/image", authenticate, requireRole("admin"), upload.single("ima
 });
 
 // PATCH /api/products/:id/stock
-router.patch("/:id/stock", authenticate, requireRole("admin"), async (req, res) => {
+router.patch("/:id/stock", authenticate, requireRole("admin", "staff"), async (req, res) => {
   const { stock } = req.body;
-  if (stock == null) return res.status(400).json({ error: "stock is required" });
+  if (stock == null || isNaN(Number(stock))) {
+    return res.status(400).json({ error: "A valid stock number is required" });
+  }
+
+  const stockNum = parseInt(stock, 10);
+  if (stockNum < 0) {
+    return res.status(400).json({ error: "Stock quantity cannot be negative" });
+  }
 
   try {
-    await call("sp_update_product_stock", [req.params.id, stock]);
-    res.json({ message: "Stock updated" });
+    await call("sp_update_product_stock", [req.params.id, stockNum]);
+    res.json({ message: "Stock updated", product_id: Number(req.params.id), stock: stockNum });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
