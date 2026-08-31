@@ -2,8 +2,8 @@ const router  = require("express").Router();
 const { pool, call } = require("../db");
 const { authenticate, requireRole } = require("../middleware/auth");
 
-// GET /api/categories
-router.get("/", authenticate, async (_req, res) => {
+// GET /api/categories (Public)
+router.get("/", async (_req, res) => {
   try {
     res.json(await call("sp_get_all_categories"));
   } catch (err) {
