@@ -26,6 +26,43 @@ const upload = multer({
   },
 });
 
+// GET /api/products/best-sellers (Public)
+router.get("/best-sellers", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 8;
+    const [rows] = await pool.query(`
+      SELECT 
+        p.id,
+        p.name,
+        c.name AS category,
+        p.price,
+        p.stock,
+        p.image_url,
+        COALESCE(SUM(ti.quantity), 0) AS total_sold,
+        COALESCE(SUM(ti.subtotal), 0) AS total_revenue
+      FROM products p
+      JOIN categories c ON c.id = p.category_id
+      LEFT JOIN transaction_items ti ON ti.product_id = p.id
+      WHERE p.is_active = 1
+      GROUP BY p.id, p.name, c.name, p.price, p.stock, p.image_url
+      ORDER BY total_sold DESC, p.id ASC
+      LIMIT ?
+    `, [limit]);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/products/public (Public catalog)
+router.get("/public", async (_req, res) => {
+  try {
+    res.json(await call("sp_get_all_products"));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/products
 router.get("/", authenticate, async (_req, res) => {
   try {

@@ -50,9 +50,9 @@ router.get("/:id/items", authenticate, requireRole("admin", "staff", "customer")
 });
 
 // POST /api/transactions  — create + add items + finalize in one call
-// Body: { customer_id?, cashier_id, cash_tendered, items: [{product_id, quantity}] }
+// Body: { customer_id?, cashier_id, cash_tendered, items: [{product_id, quantity}], payment_method? }
 router.post("/", authenticate, requireRole("admin", "staff"), async (req, res) => {
-  const { customer_id, cashier_id, cash_tendered, items } = req.body;
+  const { customer_id, cashier_id, cash_tendered, items, payment_method } = req.body;
 
   if (!cashier_id || !cash_tendered || !items?.length)
     return res.status(400).json({ error: "cashier_id, cash_tendered and items are required" });
@@ -61,14 +61,41 @@ router.post("/", authenticate, requireRole("admin", "staff"), async (req, res) =
   try {
     await conn.beginTransaction();
 
+    // Resolve user_id → staff.id (frontend sends users.id, but FK references staff.id)
+    let resolvedCashierId = cashier_id;
+    const [[staffRow]] = await conn.query(
+      "SELECT id FROM staff WHERE user_id = ? LIMIT 1",
+      [cashier_id]
+    );
+    if (staffRow) {
+      resolvedCashierId = staffRow.id;
+    }
+    // Also check if the admin is directly creating (admin user_id = 1, might not have a staff row)
+    // Fallback: if no staff row found for user_id, check if cashier_id itself is a valid staff.id
+    if (!staffRow) {
+      const [[directStaff]] = await conn.query(
+        "SELECT id FROM staff WHERE id = ? LIMIT 1",
+        [cashier_id]
+      );
+      if (!directStaff) {
+        await conn.rollback();
+        return res.status(400).json({ error: "Invalid cashier: no staff record found for this user" });
+      }
+    }
+
     // 1. Create transaction shell
     await conn.query(
       "CALL sp_create_transaction(?,?,?,@tid,@rno)",
-      [customer_id || null, cashier_id, cash_tendered]
+      [customer_id || null, resolvedCashierId, cash_tendered]
     );
     const [[{ tid, rno }]] = await conn.query(
       "SELECT @tid AS tid, @rno AS rno"
     );
+
+    // Update payment method if provided
+    if (payment_method) {
+      await conn.query("UPDATE transactions SET payment_method = ? WHERE id = ?", [payment_method, tid]);
+    }
 
     // 2. Add each item
     for (const item of items) {
@@ -80,7 +107,9 @@ router.post("/", authenticate, requireRole("admin", "staff"), async (req, res) =
     const [result] = await conn.query("CALL sp_finalize_transaction(?)", [tid]);
     await conn.commit();
 
-    res.status(201).json(result[0][0]);
+    const finalRow = result[0][0];
+    finalRow.payment_method = payment_method || "Cash";
+    res.status(201).json(finalRow);
   } catch (err) {
     await conn.rollback();
     if (err.message.includes("Insufficient stock"))
