@@ -45,7 +45,6 @@ router.post("/login", async (req, res) => {
 
 // POST /api/auth/change-password
 const { authenticate } = require("../middleware/auth");
-const { pool } = require("../db");
 
 router.post("/change-password", authenticate, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -54,21 +53,17 @@ router.post("/change-password", authenticate, async (req, res) => {
   }
 
   try {
-    const conn = await pool.getConnection();
-    try {
-      const [[user]] = await conn.query("SELECT * FROM users WHERE id = ?", [req.user.id]);
-      if (!user) return res.status(404).json({ error: "User not found" });
+    const rows = await call("sp_get_user_by_id", [req.user.id]);
+    const user = rows?.[0];
+    if (!user) return res.status(404).json({ error: "User not found" });
 
-      const match = await bcrypt.compare(currentPassword, user.password);
-      if (!match) return res.status(400).json({ error: "Incorrect current password" });
+    const match = await bcrypt.compare(currentPassword, user.password);
+    if (!match) return res.status(400).json({ error: "Incorrect current password" });
 
-      const hash = await bcrypt.hash(newPassword, 10);
-      await conn.query("UPDATE users SET password = ? WHERE id = ?", [hash, req.user.id]);
+    const hash = await bcrypt.hash(newPassword, 10);
+    await call("sp_update_user_password", [req.user.id, hash]);
 
-      res.json({ message: "Password updated successfully" });
-    } finally {
-      conn.release();
-    }
+    res.json({ message: "Password updated successfully" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

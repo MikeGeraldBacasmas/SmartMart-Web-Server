@@ -31,18 +31,13 @@ router.post("/register", async (req, res) => {
     return res.status(400).json({ error: "All required fields must be provided" });
 
   try {
-    const conn = await pool.getConnection();
-    try {
-      await conn.query(
-        "CALL sp_submit_customer_registration(?,?,?,?,?,?,?,?,@cid)",
-        [last_name, first_name, middle_name || null, address,
-         date_of_birth, civil_status, gender, phone]
-      );
-      const [[r]] = await conn.query("SELECT @cid AS customer_id");
-      res.status(201).json({ message: "Registration submitted", customer_id: r.customer_id });
-    } finally {
-      conn.release();
-    }
+    const rows = await call(
+      "sp_submit_customer_registration",
+      [last_name, first_name, middle_name || null, address,
+       date_of_birth, civil_status, gender, phone]
+    );
+    const result = rows?.[0] || {};
+    res.status(201).json({ message: "Registration submitted", customer_id: result.customer_id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

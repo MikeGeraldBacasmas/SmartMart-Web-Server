@@ -17,14 +17,9 @@ router.post("/", authenticate, requireRole("admin"), async (req, res) => {
   if (!name) return res.status(400).json({ error: "Category name is required" });
 
   try {
-    const conn = await pool.getConnection();
-    try {
-      await conn.query("CALL sp_create_category(?, @cat_id)", [name]);
-      const [[r]] = await conn.query("SELECT @cat_id AS category_id");
-      res.status(201).json({ category_id: r.category_id, name });
-    } finally {
-      conn.release();
-    }
+    const rows = await call("sp_create_category", [name]);
+    const result = rows?.[0] || { category_id: null, name };
+    res.status(201).json(result);
   } catch (err) {
     if (err.message.includes("already exists"))
       return res.status(409).json({ error: err.message });
