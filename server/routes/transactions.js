@@ -16,25 +16,8 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
 // GET /api/transactions/my-history  — customer purchase history
 router.get("/my-history", authenticate, async (req, res) => {
   try {
-    const conn = await pool.getConnection();
-    try {
-      const [rows] = await conn.query(
-        `SELECT t.id, t.receipt_no,
-                IFNULL(CONCAT(c.last_name, ', ', c.first_name), 'Customer') AS customer,
-                s.full_name AS cashier,
-                t.total_amount, t.cash_tendered, t.change_amount,
-                DATE_FORMAT(t.created_at, '%b %d, %Y %h:%i %p') AS date
-         FROM transactions t
-         JOIN customers c ON c.id = t.customer_id
-         JOIN staff s ON s.id = t.cashier_id
-         WHERE c.user_id = ?
-         ORDER BY t.created_at DESC`,
-        [req.user.id]
-      );
-      res.json(rows);
-    } finally {
-      conn.release();
-    }
+    const rows = await call("sp_get_customer_purchase_history", [req.user.id]);
+    res.json(rows || []);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -61,49 +44,20 @@ router.post("/", authenticate, requireRole("admin", "staff"), async (req, res) =
   try {
     await conn.beginTransaction();
 
-    // Resolve user_id → staff.id (frontend sends users.id, but FK references staff.id)
-    let resolvedCashierId = cashier_id;
-    const [[staffRow]] = await conn.query(
-      "SELECT id FROM staff WHERE user_id = ? LIMIT 1",
-      [cashier_id]
+    // 1. Create transaction shell via stored procedure
+    const [headerRows] = await conn.query(
+      "CALL sp_create_transaction_header(?,?,?,?)",
+      [customer_id || null, cashier_id, cash_tendered, payment_method || "Cash"]
     );
-    if (staffRow) {
-      resolvedCashierId = staffRow.id;
-    }
-    // Also check if the admin is directly creating (admin user_id = 1, might not have a staff row)
-    // Fallback: if no staff row found for user_id, check if cashier_id itself is a valid staff.id
-    if (!staffRow) {
-      const [[directStaff]] = await conn.query(
-        "SELECT id FROM staff WHERE id = ? LIMIT 1",
-        [cashier_id]
-      );
-      if (!directStaff) {
-        await conn.rollback();
-        return res.status(400).json({ error: "Invalid cashier: no staff record found for this user" });
-      }
-    }
+    const tid = headerRows[0][0].transaction_id;
 
-    // 1. Create transaction shell
-    await conn.query(
-      "CALL sp_create_transaction(?,?,?,@tid,@rno)",
-      [customer_id || null, resolvedCashierId, cash_tendered]
-    );
-    const [[{ tid, rno }]] = await conn.query(
-      "SELECT @tid AS tid, @rno AS rno"
-    );
-
-    // Update payment method if provided
-    if (payment_method) {
-      await conn.query("UPDATE transactions SET payment_method = ? WHERE id = ?", [payment_method, tid]);
-    }
-
-    // 2. Add each item
+    // 2. Add each item via stored procedure
     for (const item of items) {
       await conn.query("CALL sp_add_transaction_item(?,?,?)",
         [tid, item.product_id, item.quantity]);
     }
 
-    // 3. Finalize (calculate total + change)
+    // 3. Finalize via stored procedure (calculate total + change)
     const [result] = await conn.query("CALL sp_finalize_transaction(?)", [tid]);
     await conn.commit();
 

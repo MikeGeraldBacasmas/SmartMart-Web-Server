@@ -30,25 +30,8 @@ const upload = multer({
 router.get("/best-sellers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 8;
-    const [rows] = await pool.query(`
-      SELECT 
-        p.id,
-        p.name,
-        c.name AS category,
-        p.price,
-        p.stock,
-        p.image_url,
-        COALESCE(SUM(ti.quantity), 0) AS total_sold,
-        COALESCE(SUM(ti.subtotal), 0) AS total_revenue
-      FROM products p
-      JOIN categories c ON c.id = p.category_id
-      LEFT JOIN transaction_items ti ON ti.product_id = p.id
-      WHERE p.is_active = 1
-      GROUP BY p.id, p.name, c.name, p.price, p.stock, p.image_url
-      ORDER BY total_sold DESC, p.id ASC
-      LIMIT ?
-    `, [limit]);
-    res.json(rows);
+    const rows = await call("sp_get_best_sellers", [limit]);
+    res.json(rows || []);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -88,15 +71,8 @@ router.post("/", authenticate, requireRole("admin"), async (req, res) => {
     return res.status(400).json({ error: "name, category_id, price and stock are required" });
 
   try {
-    const conn = await pool.getConnection();
-    try {
-      await conn.query("CALL sp_create_product(?,?,?,?,@pid)",
-        [name, category_id, price, stock]);
-      const [[r]] = await conn.query("SELECT @pid AS product_id");
-      res.status(201).json({ product_id: r.product_id, name, category_id, price, stock });
-    } finally {
-      conn.release();
-    }
+    const rows = await call("sp_create_product", [name, category_id, price, stock]);
+    res.status(201).json(rows?.[0] || { product_id: null, name, category_id, price, stock });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -122,8 +98,7 @@ router.post("/:id/image", authenticate, requireRole("admin"), upload.single("ima
 
   const imageUrl = `/uploads/products/${req.file.filename}`;
   try {
-    // Update only the image_url column
-    await pool.execute("UPDATE products SET image_url = ? WHERE id = ?", [imageUrl, req.params.id]);
+    await call("sp_update_product_image", [req.params.id, imageUrl]);
     res.json({ image_url: imageUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
