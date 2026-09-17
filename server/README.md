@@ -11,10 +11,9 @@
 
 ## Setup
 
-### 1. Database (SQLyog)
-1. Open SQLyog and connect to your MySQL server
-2. Run `sql/01_schema.sql` — creates the database, all tables, and seed data
-3. Run `sql/02_stored_procedures.sql` — creates all stored procedures
+### 1. Database (SQLyog / MySQL Client)
+1. Open SQLyog (or any MySQL client) and connect to your MySQL server
+2. Run `sql/smartmart_db_full.sql` — creates the database, all tables, seed data, and all 34 stored procedures
 
 ### 2. Server
 ```bash

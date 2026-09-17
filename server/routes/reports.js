@@ -615,4 +615,142 @@ router.get("/transactions", authenticate, requireRole("admin"), async (req, res)
   }
 });
 
+// ─── 8. Returns & Refunds Analytics ──────────────────────────────────────────
+// GET /api/reports/returns-analytics?from=YYYY-MM-DD&to=YYYY-MM-DD
+router.get("/returns-analytics", authenticate, requireRole("admin"), async (req, res) => {
+  const from = req.query.from || "2000-01-01";
+  const to   = req.query.to   || "2099-12-31";
+
+  try {
+    const conn = await pool.getConnection();
+    try {
+      // 1. Overall Summary
+      const [summaryRows] = await conn.query(
+        `SELECT
+           COUNT(DISTINCT r.id) AS total_returns,
+           SUM(IF(r.status = 'Pending', 1, 0)) AS pending_count,
+           SUM(IF(r.status IN ('Approved', 'Completed'), 1, 0)) AS approved_count,
+           SUM(IF(r.status = 'Rejected', 1, 0)) AS rejected_count,
+           IFNULL(SUM(IF(r.status IN ('Approved', 'Completed'), r.refund_amount, 0)), 0) AS total_refunded,
+           IFNULL(SUM(IF(r.status IN ('Approved', 'Completed'), ri.quantity, 0)), 0) AS items_returned_count
+         FROM returns r
+         LEFT JOIN return_items ri ON ri.return_id = r.id
+         WHERE DATE(r.created_at) BETWEEN ? AND ?`,
+        [from, to]
+      );
+
+      // 2. Reason Breakdown
+      const [reasonRows] = await conn.query(
+        `SELECT
+           r.reason,
+           COUNT(DISTINCT r.id) AS count,
+           IFNULL(SUM(IF(r.status IN ('Approved', 'Completed'), r.refund_amount, 0)), 0) AS refund_amount,
+           IFNULL(SUM(ri.quantity), 0) AS items_count
+         FROM returns r
+         LEFT JOIN return_items ri ON ri.return_id = r.id
+         WHERE DATE(r.created_at) BETWEEN ? AND ?
+         GROUP BY r.reason
+         ORDER BY count DESC`,
+        [from, to]
+      );
+
+      // 3. Top Returned Products
+      const [topProductRows] = await conn.query(
+        `SELECT
+           ri.product_id,
+           ri.product_name,
+           IFNULL(c.name, 'Uncategorized') AS category,
+           COUNT(DISTINCT r.id) AS return_occurrences,
+           SUM(ri.quantity) AS total_quantity_returned,
+           SUM(ri.refund_amount) AS total_refund_amount,
+           SUM(IF(ri.restock = 1, ri.quantity, 0)) AS total_restocked_quantity
+         FROM return_items ri
+         JOIN returns r ON r.id = ri.return_id
+         LEFT JOIN products p ON p.id = ri.product_id
+         LEFT JOIN categories c ON c.id = p.category_id
+         WHERE DATE(r.created_at) BETWEEN ? AND ? AND r.status IN ('Approved', 'Completed')
+         GROUP BY ri.product_id, ri.product_name, c.name
+         ORDER BY total_quantity_returned DESC
+         LIMIT 10`,
+        [from, to]
+      );
+
+      // 4. Detailed returns list in range
+      const [recentRows] = await conn.query(
+        `SELECT
+           r.id,
+           r.return_no,
+           t.receipt_no,
+           CONCAT(cust.last_name, ', ', cust.first_name) AS customer_name,
+           cust.customer_code,
+           r.status,
+           r.reason,
+           r.customer_notes,
+           r.admin_notes,
+           r.refund_amount,
+           DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS formatted_date,
+           r.created_at,
+           COUNT(ri.id) AS items_count,
+           IFNULL(SUM(ri.quantity), 0) AS total_items_quantity,
+           GROUP_CONCAT(CONCAT(ri.product_name, ' (x', ri.quantity, ')') SEPARATOR ', ') AS returned_items_summary
+         FROM returns r
+         JOIN transactions t ON t.id = r.transaction_id
+         JOIN customers cust ON cust.id = r.customer_id
+         LEFT JOIN return_items ri ON ri.return_id = r.id
+         WHERE DATE(r.created_at) BETWEEN ? AND ?
+         GROUP BY r.id
+         ORDER BY r.created_at DESC`,
+        [from, to]
+      );
+
+      res.json({
+        summary: {
+          total_returns: Number(summaryRows[0]?.total_returns || 0),
+          pending_count: Number(summaryRows[0]?.pending_count || 0),
+          approved_count: Number(summaryRows[0]?.approved_count || 0),
+          rejected_count: Number(summaryRows[0]?.rejected_count || 0),
+          total_refunded: Number(summaryRows[0]?.total_refunded || 0),
+          items_returned_count: Number(summaryRows[0]?.items_returned_count || 0),
+        },
+        reasons: reasonRows.map(row => ({
+          reason: row.reason,
+          count: Number(row.count),
+          refund_amount: Number(row.refund_amount),
+          items_count: Number(row.items_count),
+        })),
+        top_returned_products: topProductRows.map(row => ({
+          product_id: row.product_id,
+          product_name: row.product_name,
+          category: row.category,
+          return_occurrences: Number(row.return_occurrences),
+          total_quantity_returned: Number(row.total_quantity_returned),
+          total_refund_amount: Number(row.total_refund_amount),
+          total_restocked_quantity: Number(row.total_restocked_quantity),
+        })),
+        returns_list: recentRows.map(row => ({
+          id: row.id,
+          return_no: row.return_no,
+          receipt_no: row.receipt_no,
+          customer_name: row.customer_name,
+          customer_code: row.customer_code,
+          status: row.status,
+          reason: row.reason,
+          customer_notes: row.customer_notes,
+          admin_notes: row.admin_notes,
+          refund_amount: Number(row.refund_amount),
+          date: row.formatted_date,
+          items_count: Number(row.items_count),
+          total_items_quantity: Number(row.total_items_quantity),
+          returned_items_summary: row.returned_items_summary || "None",
+        })),
+      });
+    } finally {
+      conn.release();
+    }
+  } catch (err) {
+    console.error("Error in /api/reports/returns-analytics:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

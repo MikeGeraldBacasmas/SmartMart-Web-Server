@@ -20,6 +20,7 @@ app.use("/api/transactions", require("./routes/transactions"));
 app.use("/api/settings",     require("./routes/settings"));
 app.use("/api/dashboard",    require("./routes/dashboard"));
 app.use("/api/reports",      require("./routes/reports"));
+app.use("/api/returns",      require("./routes/returns"));
 
 // ─── Health check ─────────────────────────────────────────────
 app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "SmartMart API" }));
