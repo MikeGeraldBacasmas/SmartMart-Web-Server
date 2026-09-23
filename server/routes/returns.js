@@ -2,78 +2,22 @@ const router = require("express").Router();
 const { pool } = require("../db");
 const { authenticate, requireRole } = require("../middleware/auth");
 
-// Helper to get customer id from user id
-async function getCustomerIdByUserId(conn, userId) {
-  const [rows] = await conn.query("SELECT id FROM customers WHERE user_id = ?", [userId]);
-  return rows[0]?.id || null;
-}
-
-// ─── GET /api/returns/my-returns ─────────────────────────────────────────────
-// Customer gets all their return requests
-router.get("/my-returns", authenticate, async (req, res) => {
-  try {
-    const customerId = await getCustomerIdByUserId(pool, req.user.id);
-    if (!customerId) {
-      return res.status(404).json({ error: "Customer profile not found" });
-    }
-
-    const [returns] = await pool.query(
-      `SELECT r.id, r.return_no, r.transaction_id, t.receipt_no, r.customer_id,
-              r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount,
-              DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS created_at,
-              DATE_FORMAT(r.processed_at, '%b %d, %Y %h:%i %p') AS processed_at,
-              u.username AS processed_by_username
-       FROM returns r
-       JOIN transactions t ON t.id = r.transaction_id
-       LEFT JOIN users u ON u.id = r.processed_by
-       WHERE r.customer_id = ?
-       ORDER BY r.created_at DESC`,
-      [customerId]
-    );
-
-    if (returns.length === 0) {
-      return res.json([]);
-    }
-
-    const returnIds = returns.map(r => r.id);
-    const [items] = await pool.query(
-      `SELECT ri.id, ri.return_id, ri.transaction_item_id, ri.product_id,
-              ri.product_name, ri.quantity, ri.unit_price, ri.refund_amount, ri.restock
-       FROM return_items ri
-       WHERE ri.return_id IN (?)`,
-      [returnIds]
-    );
-
-    const itemsByReturnId = {};
-    for (const item of items) {
-      if (!itemsByReturnId[item.return_id]) itemsByReturnId[item.return_id] = [];
-      itemsByReturnId[item.return_id].push(item);
-    }
-
-    const result = returns.map(r => ({
-      ...r,
-      items: itemsByReturnId[r.id] || []
-    }));
-
-    res.json(result);
-  } catch (err) {
-    console.error("Error fetching customer returns:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ─── GET /api/returns/transaction/:id/returnable-items ────────────────────────
 // Get items from a transaction with computed available return quantities
-router.get("/transaction/:id/returnable-items", authenticate, async (req, res) => {
+router.get("/transaction/:id/returnable-items", authenticate, requireRole("admin", "staff"), async (req, res) => {
   const transactionId = req.params.id;
   try {
     // Check transaction exists
     const [txRows] = await pool.query(
       `SELECT t.id, t.receipt_no, t.customer_id, t.total_amount,
               DATE_FORMAT(t.created_at, '%b %d, %Y %h:%i %p') AS date,
-              c.user_id AS customer_user_id
+              c.user_id AS customer_user_id,
+              CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
+              COALESCE(s.full_name, cu.username, 'Cashier') AS cashier_name
        FROM transactions t
        LEFT JOIN customers c ON c.id = t.customer_id
+       LEFT JOIN staff s ON s.id = t.cashier_id
+       LEFT JOIN users cu ON cu.id = s.user_id
        WHERE t.id = ?`,
       [transactionId]
     );
@@ -83,24 +27,23 @@ router.get("/transaction/:id/returnable-items", authenticate, async (req, res) =
     }
 
     const tx = txRows[0];
-    if (req.user.role === "customer" && tx.customer_user_id !== req.user.id) {
-      return res.status(403).json({ error: "Access denied to this transaction" });
-    }
 
-    // Get items from transaction_items
+    // Get items from transaction_items with current stock
     const [items] = await pool.query(
-      `SELECT id AS transaction_item_id, product_id, product_name, unit_price, quantity AS purchased_quantity, subtotal
-       FROM transaction_items
-       WHERE transaction_id = ?`,
+      `SELECT ti.id AS transaction_item_id, ti.product_id, ti.product_name, ti.unit_price, ti.quantity AS purchased_quantity, ti.subtotal,
+              p.stock AS current_stock
+       FROM transaction_items ti
+       LEFT JOIN products p ON p.id = ti.product_id
+       WHERE ti.transaction_id = ?`,
       [transactionId]
     );
 
-    // Get already returned or pending returned quantity for each item
+    // Get already returned quantity for each item (Approved or Completed returns)
     const [returnedRows] = await pool.query(
       `SELECT ri.transaction_item_id, SUM(ri.quantity) AS total_returned
        FROM return_items ri
        JOIN returns r ON r.id = ri.return_id
-       WHERE r.transaction_id = ? AND r.status NOT IN ('Rejected', 'Cancelled')
+       WHERE r.transaction_id = ? AND r.status IN ('Completed', 'Approved')
        GROUP BY ri.transaction_item_id`,
       [transactionId]
     );
@@ -132,46 +75,39 @@ router.get("/transaction/:id/returnable-items", authenticate, async (req, res) =
 });
 
 // ─── POST /api/returns ────────────────────────────────────────────────────────
-// Customer creates a return request
-router.post("/", authenticate, async (req, res) => {
-  const { transaction_id, reason, customer_notes, items } = req.body;
+// Staff creates a return for a walk-in customer with immediate review options
+router.post("/", authenticate, requireRole("staff"), async (req, res) => {
+  const {
+    transaction_id,
+    reason,
+    customer_notes,
+    admin_notes,
+    status = "Completed",
+    restock = true,
+    items
+  } = req.body;
 
   if (!transaction_id || !reason || !items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "transaction_id, reason, and items array are required" });
   }
 
+  const validStatuses = ["Completed", "Approved", "Rejected", "Pending"];
+  const finalStatus = validStatuses.includes(status) ? status : "Completed";
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // Verify customer
-    let customerId;
-    if (req.user.role === "customer") {
-      customerId = await getCustomerIdByUserId(conn, req.user.id);
-      if (!customerId) {
-        await conn.rollback();
-        return res.status(404).json({ error: "Customer record not found" });
-      }
-
-      // Check transaction belongs to this customer
-      const [tx] = await conn.query("SELECT customer_id FROM transactions WHERE id = ?", [transaction_id]);
-      if (tx.length === 0 || tx[0].customer_id !== customerId) {
-        await conn.rollback();
-        return res.status(403).json({ error: "You can only return items from your own purchases" });
-      }
-    } else {
-      // Staff or Admin initiating a return
-      const [tx] = await conn.query("SELECT customer_id FROM transactions WHERE id = ?", [transaction_id]);
-      if (tx.length === 0) {
-        await conn.rollback();
-        return res.status(404).json({ error: "Transaction not found" });
-      }
-      customerId = tx[0].customer_id;
-      if (!customerId) {
-        // If walk-in transaction, returns need a customer or can't be requested online
-        await conn.rollback();
-        return res.status(400).json({ error: "Cannot process return for walk-in without customer record" });
-      }
+    // Get the customer from the transaction
+    const [tx] = await conn.query("SELECT customer_id FROM transactions WHERE id = ?", [transaction_id]);
+    if (tx.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    const customerId = tx[0].customer_id;
+    if (!customerId) {
+      await conn.rollback();
+      return res.status(400).json({ error: "Cannot process return for a transaction without a customer record" });
     }
 
     // Validate each item and calculate refund total
@@ -200,12 +136,12 @@ router.post("/", authenticate, async (req, res) => {
 
       const tItem = tItemRows[0];
 
-      // Check past returned quantity
+      // Check past returned quantity (Approved or Completed returns)
       const [prevReturns] = await conn.query(
         `SELECT IFNULL(SUM(ri.quantity), 0) AS returned_qty
          FROM return_items ri
          JOIN returns r ON r.id = ri.return_id
-         WHERE ri.transaction_item_id = ? AND r.status NOT IN ('Rejected', 'Cancelled')`,
+         WHERE ri.transaction_item_id = ? AND r.status IN ('Completed', 'Approved')`,
         [transaction_item_id]
       );
 
@@ -241,35 +177,49 @@ router.post("/", authenticate, async (req, res) => {
     const seq = String(countRows[0].seq).padStart(4, "0");
     const returnNo = `RET-${currentYear}-${seq}`;
 
+    const isProcessedNow = finalStatus !== "Pending";
+
     // Insert returns record
     const [retResult] = await conn.query(
-      `INSERT INTO returns (return_no, transaction_id, customer_id, status, reason, customer_notes, refund_amount)
-       VALUES (?, ?, ?, 'Pending', ?, ?, ?)`,
-      [returnNo, transaction_id, customerId, reason, customer_notes || null, totalRefund]
+      `INSERT INTO returns (return_no, transaction_id, customer_id, status, reason, customer_notes, admin_notes, refund_amount, processed_by, processed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ${isProcessedNow ? "NOW()" : "NULL"})`,
+      [returnNo, transaction_id, customerId, finalStatus, reason, customer_notes || null, admin_notes || null, totalRefund, req.user.id]
     );
 
     const returnId = retResult.insertId;
+    const shouldRestock = (finalStatus === "Completed" || finalStatus === "Approved") && Boolean(restock);
 
-    // Insert return_items records
+    // Insert return_items records and optionally restock
     for (const vItem of validatedItems) {
       await conn.query(
         `INSERT INTO return_items (return_id, transaction_item_id, product_id, product_name, quantity, unit_price, refund_amount, restock)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
-        [returnId, vItem.transaction_item_id, vItem.product_id, vItem.product_name, vItem.quantity, vItem.unit_price, vItem.refund_amount]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [returnId, vItem.transaction_item_id, vItem.product_id, vItem.product_name, vItem.quantity, vItem.unit_price, vItem.refund_amount, shouldRestock ? 1 : 0]
       );
+
+      if (shouldRestock) {
+        await conn.query("UPDATE products SET stock = stock + ? WHERE id = ?", [vItem.quantity, vItem.product_id]);
+      }
     }
 
     await conn.commit();
 
+    const successMsg = finalStatus === "Rejected"
+      ? "Return rejected successfully"
+      : (finalStatus === "Completed" || finalStatus === "Approved")
+      ? "Walk-in return approved & refund completed successfully!"
+      : "Walk-in return submitted successfully";
+
     res.status(201).json({
-      message: "Return request submitted successfully",
+      message: successMsg,
       return_id: returnId,
       return_no: returnNo,
+      status: finalStatus,
       refund_amount: totalRefund
     });
   } catch (err) {
     await conn.rollback();
-    console.error("Error creating return request:", err);
+    console.error("Error creating return:", err);
     res.status(500).json({ error: err.message });
   } finally {
     conn.release();
@@ -286,6 +236,7 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
       SELECT r.id, r.return_no, r.transaction_id, t.receipt_no, r.customer_id,
              CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
              c.customer_code, c.phone AS customer_phone,
+             COALESCE(s.full_name, cu.username, 'Cashier') AS cashier_name,
              r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount,
              DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS created_at,
              DATE_FORMAT(r.processed_at, '%b %d, %Y %h:%i %p') AS processed_at,
@@ -295,6 +246,8 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
       FROM returns r
       JOIN transactions t ON t.id = r.transaction_id
       JOIN customers c ON c.id = r.customer_id
+      LEFT JOIN staff s ON s.id = t.cashier_id
+      LEFT JOIN users cu ON cu.id = s.user_id
       LEFT JOIN users u ON u.id = r.processed_by
       LEFT JOIN return_items ri ON ri.return_id = r.id
       WHERE 1=1
@@ -302,8 +255,12 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
     const params = [];
 
     if (status && status !== "All") {
-      query += " AND r.status = ?";
-      params.push(status);
+      if (status === "Approved") {
+        query += " AND r.status IN ('Approved', 'Completed')";
+      } else {
+        query += " AND r.status = ?";
+        params.push(status);
+      }
     }
 
     if (from) {
@@ -322,10 +279,11 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
         t.receipt_no LIKE ? OR
         c.first_name LIKE ? OR
         c.last_name LIKE ? OR
-        c.customer_code LIKE ?
+        c.customer_code LIKE ? OR
+        s.full_name LIKE ?
       )`;
       const s = `%${search}%`;
-      params.push(s, s, s, s, s);
+      params.push(s, s, s, s, s, s);
     }
 
     query += ` GROUP BY r.id ORDER BY r.created_at DESC`;
@@ -354,21 +312,90 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
   }
 });
 
+// ─── GET /api/returns/my-history ─────────────────────────────────────────────
+// Customer gets their own return history
+router.get("/my-history", authenticate, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT r.id, r.return_no, r.transaction_id, t.receipt_no,
+              CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
+              c.customer_code,
+              COALESCE(s.full_name, 'Cashier') AS cashier_name,
+              r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount,
+              DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS created_at,
+              DATE_FORMAT(r.processed_at, '%b %d, %Y %h:%i %p') AS processed_at,
+              COUNT(ri.id) AS item_count,
+              IFNULL(SUM(ri.quantity), 0) AS total_items_quantity
+       FROM returns r
+       JOIN transactions t ON t.id = r.transaction_id
+       JOIN customers c ON c.id = r.customer_id
+       LEFT JOIN staff s ON s.id = t.cashier_id
+       LEFT JOIN return_items ri ON ri.return_id = r.id
+       WHERE c.user_id = ?
+       GROUP BY r.id
+       ORDER BY r.created_at DESC`,
+      [req.user.id]
+    );
+
+    res.json(rows || []);
+  } catch (err) {
+    console.error("Error fetching customer return history:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/returns/customer/:customerId ───────────────────────────────────
+// Staff/Admin gets all returns of a specific customer
+router.get("/customer/:customerId", authenticate, requireRole("admin", "staff"), async (req, res) => {
+  const customerId = req.params.customerId;
+  try {
+    const [rows] = await pool.query(
+      `SELECT r.id, r.return_no, r.transaction_id, t.receipt_no,
+              CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
+              c.customer_code,
+              COALESCE(s.full_name, 'Cashier') AS cashier_name,
+              r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount,
+              DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS created_at,
+              DATE_FORMAT(r.processed_at, '%b %d, %Y %h:%i %p') AS processed_at,
+              COUNT(ri.id) AS item_count,
+              IFNULL(SUM(ri.quantity), 0) AS total_items_quantity
+       FROM returns r
+       JOIN transactions t ON t.id = r.transaction_id
+       JOIN customers c ON c.id = r.customer_id
+       LEFT JOIN staff s ON s.id = t.cashier_id
+       LEFT JOIN return_items ri ON ri.return_id = r.id
+       WHERE r.customer_id = ?
+       GROUP BY r.id
+       ORDER BY r.created_at DESC`,
+      [customerId]
+    );
+
+    res.json(rows || []);
+  } catch (err) {
+    console.error("Error fetching returns for customer:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── GET /api/returns/:id ─────────────────────────────────────────────────────
-// Get details of a single return request
+// Get details of a single return record (staff/admin or return owner)
 router.get("/:id", authenticate, async (req, res) => {
   try {
     const [rRows] = await pool.query(
       `SELECT r.id, r.return_no, r.transaction_id, t.receipt_no, r.customer_id,
               CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
-              c.customer_code, c.phone AS customer_phone, c.user_id AS customer_user_id,
+              c.customer_code, c.phone AS customer_phone,
+              COALESCE(s.full_name, cu.username, 'Cashier') AS cashier_name,
               r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount,
               DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS created_at,
               DATE_FORMAT(r.processed_at, '%b %d, %Y %h:%i %p') AS processed_at,
-              u.username AS processed_by_username
+              u.username AS processed_by_username,
+              c.user_id AS customer_user_id
        FROM returns r
        JOIN transactions t ON t.id = r.transaction_id
        JOIN customers c ON c.id = r.customer_id
+       LEFT JOIN staff s ON s.id = t.cashier_id
+       LEFT JOIN users cu ON cu.id = s.user_id
        LEFT JOIN users u ON u.id = r.processed_by
        WHERE r.id = ?`,
       [req.params.id]
@@ -379,6 +406,7 @@ router.get("/:id", authenticate, async (req, res) => {
     }
 
     const ret = rRows[0];
+
     if (req.user.role === "customer" && ret.customer_user_id !== req.user.id) {
       return res.status(403).json({ error: "Access denied" });
     }
@@ -402,8 +430,8 @@ router.get("/:id", authenticate, async (req, res) => {
 });
 
 // ─── PATCH /api/returns/:id/status ───────────────────────────────────────────
-// Staff/Admin updates return status (Approved, Rejected, Completed)
-router.patch("/:id/status", authenticate, requireRole("admin", "staff"), async (req, res) => {
+// Staff updates return status (Approved, Rejected, Completed) - Admin is view only
+router.patch("/:id/status", authenticate, requireRole("staff"), async (req, res) => {
   const { status, admin_notes, restock = true } = req.body;
 
   const validStatuses = ["Approved", "Completed", "Rejected"];
@@ -461,41 +489,6 @@ router.patch("/:id/status", authenticate, requireRole("admin", "staff"), async (
     res.status(500).json({ error: err.message });
   } finally {
     conn.release();
-  }
-});
-
-// ─── POST /api/returns/:id/cancel ─────────────────────────────────────────────
-// Customer cancels their pending return request
-router.post("/:id/cancel", authenticate, async (req, res) => {
-  try {
-    const customerId = await getCustomerIdByUserId(pool, req.user.id);
-    if (!customerId) {
-      return res.status(404).json({ error: "Customer profile not found" });
-    }
-
-    const [rRows] = await pool.query(
-      "SELECT * FROM returns WHERE id = ? AND customer_id = ?",
-      [req.params.id, customerId]
-    );
-
-    if (rRows.length === 0) {
-      return res.status(404).json({ error: "Return record not found" });
-    }
-
-    const ret = rRows[0];
-    if (ret.status !== "Pending") {
-      return res.status(400).json({ error: "Only pending return requests can be cancelled" });
-    }
-
-    await pool.query(
-      "UPDATE returns SET status = 'Cancelled', processed_at = NOW() WHERE id = ?",
-      [req.params.id]
-    );
-
-    res.json({ message: "Return request cancelled successfully" });
-  } catch (err) {
-    console.error("Error cancelling return request:", err);
-    res.status(500).json({ error: err.message });
   }
 });
 
