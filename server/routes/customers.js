@@ -24,7 +24,8 @@ router.get("/pending", authenticate, requireRole("admin"), async (_req, res) => 
 // POST /api/customers/register  — public, no auth
 router.post("/register", async (req, res) => {
   const { last_name, first_name, middle_name, address,
-          date_of_birth, civil_status, gender, phone } = req.body;
+          date_of_birth, civil_status, gender, phone,
+          discount_type, discount_id_no } = req.body;
 
   if (!last_name || !first_name || !address || !date_of_birth
       || !civil_status || !gender || !phone)
@@ -37,6 +38,14 @@ router.post("/register", async (req, res) => {
        date_of_birth, civil_status, gender, phone]
     );
     const result = rows?.[0] || {};
+
+    if (result.customer_id && (discount_type === "Senior Citizen" || discount_type === "PWD") && discount_id_no?.trim()) {
+      await pool.query(
+        "UPDATE customers SET discount_type = ?, discount_id_no = ? WHERE id = ?",
+        [discount_type, discount_id_no.trim(), result.customer_id]
+      );
+    }
+
     res.status(201).json({ message: "Registration submitted", customer_id: result.customer_id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -58,7 +67,8 @@ router.get("/my-profile", authenticate, requireRole("customer"), async (req, res
 // PUT /api/customers/my-profile — customer updates own profile
 router.put("/my-profile", authenticate, requireRole("customer"), async (req, res) => {
   const { first_name, last_name, middle_name, address,
-          phone, gender, civil_status, date_of_birth } = req.body;
+          phone, gender, civil_status, date_of_birth,
+          discount_type, discount_id_no } = req.body;
 
   if (!first_name || !last_name || !address || !phone
       || !gender || !civil_status || !date_of_birth)
@@ -72,7 +82,32 @@ router.put("/my-profile", authenticate, requireRole("customer"), async (req, res
     const updated = rows?.[0];
     if (!updated)
       return res.status(404).json({ error: "Customer profile not found" });
+
+    if (discount_type !== undefined) {
+      const dtype = (discount_type === "Senior Citizen" || discount_type === "PWD") ? discount_type : "None";
+      const did = dtype !== "None" ? (discount_id_no?.trim() || null) : null;
+      await pool.query("UPDATE customers SET discount_type = ?, discount_id_no = ? WHERE user_id = ?", [dtype, did, req.user.id]);
+      updated.discount_type = dtype;
+      updated.discount_id_no = did;
+    }
+
     res.json({ message: "Profile updated successfully", profile: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/customers/:id/discount — admin/staff updates customer's discount status and ID
+router.put("/:id/discount", authenticate, requireRole("admin", "staff"), async (req, res) => {
+  const { discount_type, discount_id_no } = req.body;
+  const dtype = (discount_type === "Senior Citizen" || discount_type === "PWD") ? discount_type : "None";
+  const did = dtype !== "None" ? (discount_id_no?.trim() || null) : null;
+  try {
+    await pool.query(
+      "UPDATE customers SET discount_type = ?, discount_id_no = ? WHERE id = ?",
+      [dtype, did, req.params.id]
+    );
+    res.json({ message: "Customer discount status updated", discount_type: dtype, discount_id_no: did });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
