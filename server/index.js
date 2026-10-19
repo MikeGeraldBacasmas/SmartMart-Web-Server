@@ -1,14 +1,46 @@
-require("dotenv").config();
+const path    = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const cors    = require("cors");
-const path    = require("path");
+
+// ─── Required environment variables ───────────────────────────
+if (!process.env.JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET is not set. Add it to your environment (Render → Environment) or server/.env");
+  process.exit(1);
+}
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Render (and most PaaS hosts) sit behind a reverse proxy
+app.set("trust proxy", 1);
+
+// ─── CORS ─────────────────────────────────────────────────────
+// CORS_ORIGIN: comma-separated list of allowed frontend origins,
+// e.g. "https://smartmart.com,https://www.smartmart.com".
+// If unset, all origins are allowed (handy for local development).
+const allowedOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((o) => o.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Allow non-browser requests (curl, health checks) and any origin when no allowlist is configured
+      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        return cb(null, true);
+      }
+      return cb(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+    credentials: true,
+  })
+);
+app.use(express.json({ limit: "2mb" }));
 
 // ─── Serve uploaded images ────────────────────────────────────
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// UPLOAD_DIR lets you point uploads at a persistent disk on Render (e.g. /var/data/uploads)
+const uploadRoot = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
+app.use("/uploads", express.static(uploadRoot));
 
 // ─── Routes ───────────────────────────────────────────────────
 app.use("/api/auth",         require("./routes/auth"));
@@ -23,6 +55,7 @@ app.use("/api/reports",      require("./routes/reports"));
 app.use("/api/returns",      require("./routes/returns"));
 
 // ─── Health check ─────────────────────────────────────────────
+app.get("/", (_req, res) => res.json({ status: "ok", app: "SmartMart API" }));
 app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "SmartMart API" }));
 
 // ─── 404 ──────────────────────────────────────────────────────
@@ -31,8 +64,11 @@ app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 // ─── Error handler ────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err);
+  if (err && /not allowed by CORS/.test(err.message)) {
+    return res.status(403).json({ error: err.message });
+  }
   res.status(500).json({ error: "Internal server error" });
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`SmartMart API running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`SmartMart API running on port ${PORT}`));
