@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.local
 .env.*
+!.env.example
 
 # Logs
 logs/
@@ -18,3 +19,8 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
+
+#SQL
+.sql
+*.sql/
+*.sql

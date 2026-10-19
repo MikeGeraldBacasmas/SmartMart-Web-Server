@@ -6,7 +6,9 @@ const { pool, call } = require("../db");
 const { authenticate, requireRole } = require("../middleware/auth");
 
 // ─── Multer config for product images ─────────────────────────
-const uploadDir = path.join(__dirname, "..", "uploads", "products");
+// UPLOAD_DIR (optional) points to a persistent disk in production, e.g. /var/data/uploads
+const uploadRoot = process.env.UPLOAD_DIR || path.join(__dirname, "..", "uploads");
+const uploadDir = path.join(uploadRoot, "products");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
