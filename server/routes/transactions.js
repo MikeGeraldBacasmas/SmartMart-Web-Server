@@ -300,6 +300,7 @@ router.get("/customer/:customerId", authenticate, requireRole("admin", "staff"),
               CONCAT(s.full_name) AS cashier,
               t.subtotal_amount, t.discount_type, t.discount_id_no, t.discount_amount,
               t.total_amount, t.cash_tendered, t.change_amount,
+              TIMESTAMPDIFF(MINUTE, t.created_at, NOW()) AS elapsed_minutes,
               DATE_FORMAT(t.created_at, '%b %d, %Y %h:%i %p') AS date
        FROM transactions t
        LEFT JOIN customers c ON c.id = t.customer_id
@@ -357,13 +358,39 @@ router.get("/customer/:customerId", authenticate, requireRole("admin", "staff"),
     }
 
     const result = transactions.map(t => {
-      const txItems = itemsByTx[t.id] || [];
+      const elapsedMinutes = Number(t.elapsed_minutes) || 0;
+      const isReturnWindowExpired = elapsedMinutes > 1440; // > 24 hours
+      const elapsedHours = Math.round((elapsedMinutes / 60) * 10) / 10;
+      const rawTxItems = itemsByTx[t.id] || [];
+
+      const txItems = rawTxItems.map(i => {
+        const canReturn = !isReturnWindowExpired && i.available_quantity > 0;
+        let ineligibleReason = null;
+        if (isReturnWindowExpired) {
+          ineligibleReason = "Past 24-hour return period";
+        } else if (i.available_quantity <= 0) {
+          ineligibleReason = "Item has already been fully returned";
+        }
+        return {
+          ...i,
+          is_returnable: canReturn,
+          return_ineligible_reason: ineligibleReason
+        };
+      });
+
       const returnableItems = txItems.filter(i => i.is_returnable);
       const isFullyReturned = txItems.length > 0 && txItems.every(i => i.is_fully_returned);
       const hasReturnedItems = txItems.some(i => i.already_returned > 0);
 
       return {
         ...t,
+        elapsed_minutes: elapsedMinutes,
+        elapsed_hours: elapsedHours,
+        return_window_hours: 24,
+        is_return_window_expired: isReturnWindowExpired,
+        return_window_error: isReturnWindowExpired
+          ? "Items can only be returned within 24 hours of purchase."
+          : null,
         items: txItems,
         returnable_items: returnableItems,
         is_fully_returned: isFullyReturned,
