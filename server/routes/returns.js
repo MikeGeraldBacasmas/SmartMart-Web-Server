@@ -10,6 +10,8 @@ router.get("/transaction/:id/returnable-items", authenticate, requireRole("admin
     // Check transaction exists
     const [txRows] = await pool.query(
       `SELECT t.id, t.receipt_no, t.customer_id, t.total_amount,
+              t.created_at,
+              TIMESTAMPDIFF(MINUTE, t.created_at, NOW()) AS elapsed_minutes,
               DATE_FORMAT(t.created_at, '%b %d, %Y %h:%i %p') AS date,
               c.user_id AS customer_user_id,
               CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
@@ -27,6 +29,18 @@ router.get("/transaction/:id/returnable-items", authenticate, requireRole("admin
     }
 
     const tx = txRows[0];
+    const elapsedMinutes = Number(tx.elapsed_minutes || 0);
+    const isReturnWindowExpired = elapsedMinutes > 1440; // > 24 hours
+    const elapsedHours = Math.round((elapsedMinutes / 60) * 10) / 10;
+    const daysPassed = (elapsedMinutes / 1440).toFixed(1);
+
+    tx.elapsed_minutes = elapsedMinutes;
+    tx.elapsed_hours = elapsedHours;
+    tx.return_window_hours = 24;
+    tx.is_return_window_expired = isReturnWindowExpired;
+    if (isReturnWindowExpired) {
+      tx.return_window_error = "Items can only be returned within 24 hours of purchase.";
+    }
 
     // Get items from transaction_items with current stock
     const [items] = await pool.query(
@@ -56,11 +70,20 @@ router.get("/transaction/:id/returnable-items", authenticate, requireRole("admin
     const returnableItems = items.map(item => {
       const alreadyReturned = returnedMap[item.transaction_item_id] || 0;
       const availableQuantity = Math.max(0, item.purchased_quantity - alreadyReturned);
+      const isReturnable = (!isReturnWindowExpired && availableQuantity > 0);
+      let returnIneligibleReason = null;
+      if (isReturnWindowExpired) {
+        returnIneligibleReason = "Past 24-hour return period";
+      } else if (availableQuantity <= 0) {
+        returnIneligibleReason = "Item has already been fully returned";
+      }
+
       return {
         ...item,
         already_returned: alreadyReturned,
         available_quantity: availableQuantity,
-        is_returnable: availableQuantity > 0
+        is_returnable: isReturnable,
+        return_ineligible_reason: returnIneligibleReason
       };
     });
 
@@ -98,8 +121,16 @@ router.post("/", authenticate, requireRole("staff"), async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // Get the customer from the transaction
-    const [tx] = await conn.query("SELECT customer_id FROM transactions WHERE id = ?", [transaction_id]);
+    // Get the customer and purchase time from the transaction
+    const [tx] = await conn.query(
+      `SELECT customer_id, created_at,
+              TIMESTAMPDIFF(MINUTE, created_at, NOW()) AS elapsed_minutes,
+              DATE_FORMAT(created_at, '%b %d, %Y %h:%i %p') AS purchase_date
+       FROM transactions
+       WHERE id = ?`,
+      [transaction_id]
+    );
+
     if (tx.length === 0) {
       await conn.rollback();
       return res.status(404).json({ error: "Transaction not found" });
@@ -108,6 +139,17 @@ router.post("/", authenticate, requireRole("staff"), async (req, res) => {
     if (!customerId) {
       await conn.rollback();
       return res.status(400).json({ error: "Cannot process return for a transaction without a customer record" });
+    }
+
+    // Return period validation: Freshly bought only (within 24 hours)
+    const elapsedMinutes = Number(tx[0].elapsed_minutes || 0);
+    const MAX_RETURN_MINUTES = 24 * 60; // 1440 minutes (24 hours)
+
+    if (elapsedMinutes > MAX_RETURN_MINUTES) {
+      await conn.rollback();
+      return res.status(400).json({
+        error: "Items can only be returned within 24 hours of purchase."
+      });
     }
 
     // Validate each item and calculate refund total
