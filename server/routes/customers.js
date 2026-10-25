@@ -140,4 +140,50 @@ router.post("/:id/deny", authenticate, requireRole("admin"), async (req, res) =>
   }
 });
 
+// POST /api/customers/:id/reset-password — admin resets customer password
+router.post("/:id/reset-password", authenticate, requireRole("admin"), async (req, res) => {
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.trim().length < 6)
+    return res.status(400).json({ error: "New password must be at least 6 characters" });
+
+  try {
+    const [custRows] = await pool.query(
+      `SELECT c.id, c.user_id, c.customer_code,
+              CONCAT(c.first_name, ' ', c.last_name) AS full_name,
+              u.username
+       FROM customers c
+       LEFT JOIN users u ON u.id = c.user_id
+       WHERE c.id = ?`,
+      [req.params.id]
+    );
+
+    if (!custRows.length) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
+    const customer = custRows[0];
+    if (!customer.user_id) {
+      return res.status(400).json({ error: "Customer does not have an active user account yet" });
+    }
+
+    const cleanPw = newPassword.trim();
+    const hash = await bcrypt.hash(cleanPw, 10);
+
+    // Update password in users table
+    await pool.query("UPDATE users SET password = ? WHERE id = ?", [hash, customer.user_id]);
+
+    // Update temp_password in customers table
+    await pool.query("UPDATE customers SET temp_password = ? WHERE id = ?", [cleanPw, customer.id]);
+
+    res.json({
+      message: `Password for ${customer.full_name} reset successfully`,
+      temp_password: cleanPw,
+      customer_id: customer.id,
+      username: customer.username,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
