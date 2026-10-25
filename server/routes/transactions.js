@@ -210,6 +210,22 @@ router.post("/", authenticate, requireRole("admin", "staff"), async (req, res) =
 
   const conn = await pool.getConnection();
   try {
+    // Validate available stock for each requested item before proceeding
+    for (const item of items) {
+      const [prodRows] = await conn.query("SELECT id, name, stock FROM products WHERE id = ?", [item.product_id]);
+      if (!prodRows.length) {
+        conn.release();
+        return res.status(404).json({ error: `Product ID ${item.product_id} not found.` });
+      }
+      const prod = prodRows[0];
+      if (Number(prod.stock) < Number(item.quantity)) {
+        conn.release();
+        return res.status(422).json({
+          error: `Insufficient stock for "${prod.name}". Only ${prod.stock} left in stock, but ${item.quantity} requested.`
+        });
+      }
+    }
+
     await conn.beginTransaction();
 
     // 1. Create transaction shell via stored procedure
