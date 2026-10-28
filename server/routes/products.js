@@ -81,7 +81,7 @@ router.post("/", authenticate, requireRole("admin"), async (req, res) => {
 });
 
 // PUT /api/products/:id  — full product update
-router.put("/:id", authenticate, requireRole("admin"), async (req, res) => {
+router.put("/:id", authenticate, requireRole("admin", "staff"), async (req, res) => {
   const { name, category_id, price, stock, image_url } = req.body;
   if (!name || !category_id || price == null || stock == null)
     return res.status(400).json({ error: "name, category_id, price and stock are required" });

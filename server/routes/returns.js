@@ -107,7 +107,8 @@ router.post("/", authenticate, requireRole("staff"), async (req, res) => {
     admin_notes,
     status = "Completed",
     restock = true,
-    items
+    items,
+    replacement_item
   } = req.body;
 
   if (!transaction_id || !reason || !items || !Array.isArray(items) || items.length === 0) {
@@ -221,17 +222,56 @@ router.post("/", authenticate, requireRole("staff"), async (req, res) => {
 
     const isProcessedNow = finalStatus !== "Pending";
 
+    // Validate replacement item chosen in POS for customer
+    let replacementProductId = null;
+    let replacementProductName = null;
+    let replacementQuantity = 1;
+    let replacementUnitPrice = 0;
+    let additionalAmountPaid = 0;
+
+    if (replacement_item && replacement_item.product_id) {
+      const [repRows] = await conn.query("SELECT id, name, price, stock FROM products WHERE id = ?", [replacement_item.product_id]);
+      if (repRows.length === 0) {
+        await conn.rollback();
+        return res.status(404).json({ error: "Replacement product not found in store inventory" });
+      }
+      const rep = repRows[0];
+      const repQty = parseInt(replacement_item.quantity || 1, 10);
+      const repPrice = Number(rep.price);
+      const repTotal = repPrice * repQty;
+
+      if (repTotal < totalRefund) {
+        await conn.rollback();
+        return res.status(400).json({
+          error: `Replacement item value (${repTotal.toFixed(2)}) cannot be lower than the return credit (${totalRefund.toFixed(2)}). Customer must select an item worth at least ${totalRefund.toFixed(2)}.`
+        });
+      }
+
+      if (rep.stock < repQty) {
+        await conn.rollback();
+        return res.status(400).json({
+          error: `Insufficient stock for replacement product "${rep.name}". Only ${rep.stock} available.`
+        });
+      }
+
+      replacementProductId = rep.id;
+      replacementProductName = rep.name;
+      replacementQuantity = repQty;
+      replacementUnitPrice = repPrice;
+      additionalAmountPaid = Math.max(0, repTotal - totalRefund);
+    }
+
     // Insert returns record
     const [retResult] = await conn.query(
-      `INSERT INTO returns (return_no, transaction_id, customer_id, status, reason, customer_notes, admin_notes, refund_amount, processed_by, processed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ${isProcessedNow ? "NOW()" : "NULL"})`,
-      [returnNo, transaction_id, customerId, finalStatus, reason, customer_notes || null, admin_notes || null, totalRefund, req.user.id]
+      `INSERT INTO returns (return_no, transaction_id, customer_id, status, reason, customer_notes, admin_notes, refund_amount, replacement_product_id, replacement_product_name, replacement_quantity, replacement_unit_price, additional_amount_paid, processed_by, processed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${isProcessedNow ? "NOW()" : "NULL"})`,
+      [returnNo, transaction_id, customerId, finalStatus, reason, customer_notes || null, admin_notes || null, totalRefund, replacementProductId, replacementProductName, replacementQuantity, replacementUnitPrice, additionalAmountPaid, req.user.id]
     );
 
     const returnId = retResult.insertId;
     const shouldRestock = (finalStatus === "Completed" || finalStatus === "Approved") && Boolean(restock);
 
-    // Insert return_items records and optionally restock
+    // Insert return_items records
     for (const vItem of validatedItems) {
       await conn.query(
         `INSERT INTO return_items (return_id, transaction_item_id, product_id, product_name, quantity, unit_price, refund_amount, restock)
@@ -239,18 +279,43 @@ router.post("/", authenticate, requireRole("staff"), async (req, res) => {
         [returnId, vItem.transaction_item_id, vItem.product_id, vItem.product_name, vItem.quantity, vItem.unit_price, vItem.refund_amount, shouldRestock ? 1 : 0]
       );
 
+      // If returned item is resellable (restock = true), return it into shelf stock
       if (shouldRestock) {
         await conn.query("UPDATE products SET stock = stock + ? WHERE id = ?", [vItem.quantity, vItem.product_id]);
       }
     }
 
+    // Deduct chosen replacement item from inventory
+    if (finalStatus === "Completed" || finalStatus === "Approved") {
+      if (replacementProductId) {
+        // Decrement stock of the customer's chosen replacement item
+        await conn.query("UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?", [replacementQuantity, replacementProductId]);
+      } else {
+        // Fallback: If no specific replacement product specified, deduct same item from shelf
+        for (const vItem of validatedItems) {
+          if (!shouldRestock) {
+            await conn.query("UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?", [vItem.quantity, vItem.product_id]);
+          }
+        }
+      }
+    }
+
     await conn.commit();
 
-    const successMsg = finalStatus === "Rejected"
-      ? "Return rejected successfully"
-      : (finalStatus === "Completed" || finalStatus === "Approved")
-      ? "Walk-in return approved & refund completed successfully!"
-      : "Walk-in return submitted successfully";
+    let successMsg = "Walk-in return submitted successfully";
+    if (finalStatus === "Rejected") {
+      successMsg = "Return rejected successfully";
+    } else if (finalStatus === "Completed" || finalStatus === "Approved") {
+      if (replacementProductName) {
+        if (additionalAmountPaid > 0) {
+          successMsg = `Return completed! Replaced with ${replacementQuantity}x ${replacementProductName}. Additional ₱${additionalAmountPaid.toFixed(2)} cash collected from customer.`;
+        } else {
+          successMsg = `Return completed! Replaced with ${replacementQuantity}x ${replacementProductName} (₱0.00 additional payment).`;
+        }
+      } else {
+        successMsg = "Walk-in return approved & item replacement completed successfully!";
+      }
+    }
 
     res.status(201).json({
       message: successMsg,
@@ -279,7 +344,7 @@ router.get("/", authenticate, requireRole("admin", "staff"), async (req, res) =>
              CONCAT(c.last_name, ', ', c.first_name) AS customer_name,
              c.customer_code, c.phone AS customer_phone,
              COALESCE(s.full_name, cu.username, 'Cashier') AS cashier_name,
-             r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount,
+             r.status, r.reason, r.customer_notes, r.admin_notes, r.refund_amount, r.replacement_product_id, r.replacement_product_name, r.replacement_quantity, r.replacement_unit_price, r.additional_amount_paid,
              DATE_FORMAT(r.created_at, '%b %d, %Y %h:%i %p') AS created_at,
              DATE_FORMAT(r.processed_at, '%b %d, %Y %h:%i %p') AS processed_at,
              u.username AS processed_by_username,
@@ -503,10 +568,12 @@ router.patch("/:id/status", authenticate, requireRole("staff"), async (req, res)
     const isNowApprovedOrCompleted = (status === "Approved" || status === "Completed");
     const wasAlreadyApprovedOrCompleted = (currentReturn.status === "Approved" || currentReturn.status === "Completed");
 
-    if (isNowApprovedOrCompleted && !wasAlreadyApprovedOrCompleted && restock) {
-      for (const item of items) {
-        await conn.query("UPDATE products SET stock = stock + ? WHERE id = ?", [item.quantity, item.product_id]);
-        await conn.query("UPDATE return_items SET restock = 1 WHERE id = ?", [item.id]);
+    if (isNowApprovedOrCompleted && !wasAlreadyApprovedOrCompleted) {
+      if (!restock) {
+        // Customer was handed replacement items from shelf inventory
+        for (const item of items) {
+          await conn.query("UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?", [item.quantity, item.product_id]);
+        }
       }
     }
 
@@ -521,7 +588,7 @@ router.patch("/:id/status", authenticate, requireRole("staff"), async (req, res)
     await conn.commit();
 
     res.json({
-      message: `Return ${status.toLowerCase()} successfully`,
+      message: `Return replacement ${status.toLowerCase()} successfully`,
       id: req.params.id,
       status
     });
