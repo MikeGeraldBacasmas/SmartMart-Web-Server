@@ -81,12 +81,41 @@ app.get("/api/db-diagnostics", async (_req, res) => {
     renderOutboundIp = e.message;
   }
 
+  const net = require("net");
+  const tcpCheck = await new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(4000);
+    socket.on("connect", () => {
+      socket.destroy();
+      resolve({ success: true, message: "TCP port 3306 reachable" });
+    });
+    socket.on("timeout", () => {
+      socket.destroy();
+      resolve({ success: false, message: "TCP port 3306 connection timed out (firewall blocking)" });
+    });
+    socket.on("error", (e) => {
+      socket.destroy();
+      resolve({ success: false, message: e.message });
+    });
+    socket.connect(Number(port), host);
+  });
+
+  if (!tcpCheck.success) {
+    return res.status(500).json({
+      status: "tcp_failed",
+      renderOutboundIp,
+      tcpCheck,
+      dbConfig: { host, port, user, database, ssl },
+    });
+  }
+
   try {
     const { pool } = require("./db");
     const [rows] = await pool.query("SELECT 1 AS ok");
     return res.json({
       status: "connected",
       renderOutboundIp,
+      tcpCheck,
       dbConfig: { host, port, user, database, ssl },
       queryResult: rows,
     });
@@ -94,6 +123,7 @@ app.get("/api/db-diagnostics", async (_req, res) => {
     return res.status(500).json({
       status: "error",
       renderOutboundIp,
+      tcpCheck,
       dbConfig: { host, port, user, database, ssl },
       error: {
         code: err.code,
