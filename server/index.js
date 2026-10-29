@@ -82,29 +82,37 @@ app.get("/api/db-diagnostics", async (_req, res) => {
   }
 
   const net = require("net");
-  const tcpCheck = await new Promise((resolve) => {
+  const testTcp = (h, p) => new Promise((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(4000);
     socket.on("connect", () => {
       socket.destroy();
-      resolve({ success: true, message: "TCP port 3306 reachable" });
+      resolve({ host: h, port: p, success: true, message: "TCP reachable" });
     });
     socket.on("timeout", () => {
       socket.destroy();
-      resolve({ success: false, message: "TCP port 3306 connection timed out (firewall blocking)" });
+      resolve({ host: h, port: p, success: false, message: "Connection timed out" });
     });
     socket.on("error", (e) => {
       socket.destroy();
-      resolve({ success: false, message: e.message });
+      resolve({ host: h, port: p, success: false, message: e.message });
     });
-    socket.connect(Number(port), host);
+    socket.connect(p, h);
   });
+
+  const [checkIp, checkDomain, checkGoogle] = await Promise.all([
+    testTcp("195.35.61.31", 3306),
+    testTcp("srv1066.hstgr.io", 3306),
+    testTcp("google.com", 80),
+  ]);
+
+  const tcpCheck = checkIp.success ? checkIp : checkDomain;
 
   if (!tcpCheck.success) {
     return res.status(500).json({
       status: "tcp_failed",
       renderOutboundIp,
-      tcpCheck,
+      tcpResults: { checkIp, checkDomain, checkGoogle },
       dbConfig: { host, port, user, database, ssl },
     });
   }
