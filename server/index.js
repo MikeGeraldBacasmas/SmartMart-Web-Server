@@ -27,7 +27,13 @@ app.use(
   cors({
     origin: (origin, cb) => {
       // Allow non-browser requests (curl, health checks) and any origin when no allowlist is configured
-      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      if (
+        !origin ||
+        allowedOrigins.length === 0 ||
+        allowedOrigins.includes(origin) ||
+        origin.includes("bscs4b.com") ||
+        origin.includes("localhost")
+      ) {
         return cb(null, true);
       }
       return cb(new Error(`Origin ${origin} not allowed by CORS`));
