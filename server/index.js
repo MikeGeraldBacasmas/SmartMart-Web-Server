@@ -65,6 +65,37 @@ app.use("/api/damages",      require("./routes/damages"));
 app.get("/", (_req, res) => res.json({ status: "ok", app: "SmartMart API" }));
 app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "SmartMart API" }));
 
+app.get("/api/db-diagnostics", async (_req, res) => {
+  const host = process.env.DB_HOST || "localhost (default)";
+  const port = process.env.DB_PORT || "3306 (default)";
+  const user = process.env.DB_USER || "root (default)";
+  const database = process.env.DB_NAME || "smartmart (default)";
+  const ssl = process.env.DB_SSL || "false (default)";
+
+  try {
+    const { pool } = require("./db");
+    const [rows] = await pool.query("SELECT 1 AS ok");
+    return res.json({
+      status: "connected",
+      dbConfig: { host, port, user, database, ssl },
+      queryResult: rows,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      status: "error",
+      dbConfig: { host, port, user, database, ssl },
+      error: {
+        code: err.code,
+        errno: err.errno,
+        syscall: err.syscall,
+        address: err.address,
+        port: err.port,
+        message: err.message,
+      },
+    });
+  }
+});
+
 // ─── 404 ──────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
