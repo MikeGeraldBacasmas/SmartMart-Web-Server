@@ -72,17 +72,28 @@ app.get("/api/db-diagnostics", async (_req, res) => {
   const database = process.env.DB_NAME || "smartmart (default)";
   const ssl = process.env.DB_SSL || "false (default)";
 
+  let renderOutboundIp = "unknown";
+  try {
+    const ipRes = await fetch("https://api.ipify.org?format=json");
+    const ipData = await ipRes.json();
+    renderOutboundIp = ipData.ip;
+  } catch (e) {
+    renderOutboundIp = e.message;
+  }
+
   try {
     const { pool } = require("./db");
     const [rows] = await pool.query("SELECT 1 AS ok");
     return res.json({
       status: "connected",
+      renderOutboundIp,
       dbConfig: { host, port, user, database, ssl },
       queryResult: rows,
     });
   } catch (err) {
     return res.status(500).json({
       status: "error",
+      renderOutboundIp,
       dbConfig: { host, port, user, database, ssl },
       error: {
         code: err.code,
